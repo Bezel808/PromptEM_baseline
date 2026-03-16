@@ -4,6 +4,7 @@ import logging
 import os
 import random
 from typing import List
+from pathlib import Path
 from scipy import cluster
 from torch.nn.functional import one_hot
 from tqdm import tqdm
@@ -182,7 +183,24 @@ read_entities_funs = {
 
 
 def read_entities(data_type: str, args: PromptEMArgs):
-    read_entities_fun = read_entities_funs[data_type]
+    if data_type in read_entities_funs:
+        read_entities_fun = read_entities_funs[data_type]
+    else:
+        data_dir = Path("data") / data_type
+        left_base = data_dir / "left"
+        right_base = data_dir / "right"
+
+        def pick_reader(path_base: Path):
+            if path_base.with_suffix(".csv").exists():
+                return read_rel_entities
+            if path_base.with_suffix(".json").exists():
+                return read_semi_entities
+            if path_base.with_suffix(".txt").exists():
+                return read_text_entities
+            raise FileNotFoundError(f"Cannot find entity file for {path_base} with .csv/.json/.txt suffix.")
+
+        read_entities_fun = (pick_reader(left_base), pick_reader(right_base))
+
     left_entities = read_entities_fun[0](f"data/{data_type}/left", add_token=args.add_token,
                                          summarize=args.text_summarize)
     right_entities = read_entities_fun[1](f"data/{data_type}/right", add_token=args.add_token,

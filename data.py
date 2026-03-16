@@ -46,11 +46,12 @@ class PromptEMData:
 
 
 class TypeDataset(Dataset):
-    def __init__(self, data: PromptEMData, mode, lm='roberta-base'):
+    def __init__(self, data: PromptEMData, mode, lm='roberta-base', max_length=512):
         self.data = data
         self.mode = mode
         self.tokenizer = AutoTokenizer.from_pretrained(lm)
         self.lm = lm
+        self.max_length = max_length
         self.sentences = []
         self.labels = []
         self.type_vocab = {}
@@ -73,7 +74,7 @@ class TypeDataset(Dataset):
         for i, pair in enumerate(pairs):
             left = self.data.left_entities[pair[0]]
             right = self.data.right_entities[pair[1]]
-            sentence = self.tokenizer(left, right, truncation=True, max_length=512)
+            sentence = self.tokenizer(left, right, truncation=True, max_length=self.max_length)
             self.sentences.append(sentence['input_ids'])
             if len(y) > 0:
                 self.labels.append(y[i])

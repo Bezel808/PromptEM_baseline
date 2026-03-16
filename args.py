@@ -28,6 +28,7 @@ class PromptEMArgs:
         self.only_plm = args.only_plm
         self.teacher_epochs = args.teacher_epochs
         self.student_epochs = args.student_epochs
+        self.test_every = args.test_every
         self.test_pseudo_label = args.test_pseudo_label
         self.one_word=args.one_word
         if self.dynamic_dataset != -1:
@@ -67,9 +68,13 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=2e-5, help="(teacher) lr")
     parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--add_token", default=True)
-    parser.add_argument("--data_name", "-d", type=str,
-                        choices=["rel-heter", "rel-text", "semi-heter", "semi-homo", "semi-rel", "semi-text-c",
-                                 "semi-text-w","geo-heter", "all"], default="all")
+    parser.add_argument(
+        "--data_name",
+        "-d",
+        type=str,
+        default="all",
+        help="Dataset name under data/<data_name> (or all).",
+    )
     parser.add_argument("--template_no", "-tn", type=int, default=0, choices=[0, 1, 2, 3, 4, 5])
     parser.add_argument("--self_training", "-st", action="store_true", default=False)
     parser.add_argument("--dynamic_dataset", "-dd", type=int, default=-1,
@@ -87,6 +92,8 @@ def parse_args():
     parser.add_argument("--only_plm", "-op", action="store_true", default=False)
     parser.add_argument("--teacher_epochs", "-te", type=int, default=20)
     parser.add_argument("--student_epochs", "-se", type=int, default=30)
+    parser.add_argument("--test_every", type=int, default=1,
+                        help="Run test evaluation every N epochs.")
     parser.add_argument("--test_pseudo_label", "-tpl", type=str, default="")
     parser.add_argument("--one_word","-ow",action="store_true",default=False)
 

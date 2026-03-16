@@ -213,8 +213,8 @@ def gen_pseudo_labels(args: PromptEMArgs, data: PromptEMData, model, prompt=True
             return 0
         unlabeled_dataloader = get_prompt_dataloader(args, unlabeled_dataset, shuffle=False)
     else:
-        labeled_dataset = TypeDataset(data, "train")
-        unlabeled_dataset = TypeDataset(data, "un")
+        labeled_dataset = TypeDataset(data, "train", max_length=args.max_length)
+        unlabeled_dataset = TypeDataset(data, "un", max_length=args.max_length)
         labeled_dataloader = DataLoader(dataset=labeled_dataset, batch_size=args.batch_size,
                                         collate_fn=TypeDataset.pad, )
         unlabeled_dataloader = DataLoader(dataset=unlabeled_dataset, batch_size=args.batch_size,
