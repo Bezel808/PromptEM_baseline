@@ -1,13 +1,56 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$ROOT_DIR"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$SCRIPT_DIR"
+cd "$REPO_ROOT"
 
-PYTHON="${PYTHON:-/home/zongze/.venvs/promptem/bin/python}"
+# Python executable: env override > common local env paths > system python3
+PYTHON_BIN="${PYTHON_BIN:-}"
+if [[ -z "$PYTHON_BIN" ]]; then
+  for cand in \
+    "$REPO_ROOT/.venv/bin/python" \
+    "$REPO_ROOT/venv/bin/python" \
+    "$HOME/.venvs/promptem/bin/python" \
+    "/home/zongze/.venvs/promptem/bin/python"
+  do
+    if [[ -x "$cand" ]]; then
+      PYTHON_BIN="$cand"
+      break
+    fi
+  done
+fi
+if [[ -z "${PYTHON_BIN:-}" ]]; then
+  if command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python3)"
+  else
+    echo "[ERROR] python3 not found. Set PYTHON_BIN=/path/to/python" >&2
+    exit 1
+  fi
+fi
 
-DATA_ROOT_BASE="${DATA_ROOT_BASE:-/home/mengshi/table_quality/datasets_joint_discovery_integration}"
+# Dataset root: env override > repo-adjacent candidates > known legacy absolute path
+DATA_ROOT_BASE="${DATA_ROOT_BASE:-}"
+if [[ -z "$DATA_ROOT_BASE" ]]; then
+  for cand in \
+    "$REPO_ROOT/../A-joint" \
+    "$REPO_ROOT/../../A-joint" \
+    "$REPO_ROOT/data_1218" \
+    "/home/mengshi/table_quality/datasets_joint_discovery_integration"
+  do
+    if [[ -d "$cand" ]]; then
+      DATA_ROOT_BASE="$cand"
+      break
+    fi
+  done
+fi
+if [[ -z "${DATA_ROOT_BASE:-}" || ! -d "$DATA_ROOT_BASE" ]]; then
+  echo "[ERROR] DATA_ROOT_BASE not found. Set DATA_ROOT_BASE=/path/to/datasets_root" >&2
+  exit 1
+fi
+
 DATASETS="${DATASETS:-wikidbs_1218 santos_benchmark_1218 magellan_1218}"
+GPU="${GPU:-}"
 
 # Training defaults (full-label EM)
 DEVICE="${DEVICE:-cuda}"
@@ -34,7 +77,7 @@ MAGELLAN_TEACHER_EPOCHS="${MAGELLAN_TEACHER_EPOCHS:-10}"
 MAGELLAN_STUDENT_EPOCHS="${MAGELLAN_STUDENT_EPOCHS:-30}"
 MAGELLAN_TEST_EVERY="${MAGELLAN_TEST_EVERY:-10}"
 
-RUNS_ROOT="${RUNS_ROOT:-/home/zongze/mengshichen_projects/runs/promptem_em}"
+RUNS_ROOT="${RUNS_ROOT:-$REPO_ROOT/runs/promptem_em}"
 TS="$(date +%Y%m%d_%H%M%S)"
 RUN_DIR="${RUNS_ROOT}/k1p0_${TS}"
 LOG_DIR="${RUN_DIR}/logs"
@@ -48,17 +91,32 @@ cat > "$SUMMARY_MD" <<'MD'
 | ------- | --------: | -----: | --:| -------: | --: | --- |
 MD
 
-"$PYTHON" - <<PY
+"$PYTHON_BIN" - <<PY
 import json
 from pathlib import Path
 Path("$SUMMARY_JSON").write_text(json.dumps([], indent=2), encoding="utf-8")
 PY
 
+if [[ -n "$GPU" ]]; then
+  export CUDA_VISIBLE_DEVICES="$GPU"
+fi
+
+echo "========================================="
+echo "Start: $(date)"
+echo "Repo Root: $REPO_ROOT"
+echo "Python: $PYTHON_BIN"
+echo "Data Root: $DATA_ROOT_BASE"
+echo "GPU: ${GPU:-<not set>}"
+echo "Device: $DEVICE"
+echo "Datasets: $DATASETS"
+echo "Run Dir: $RUN_DIR"
+echo "========================================="
+
 run_dataset() {
   local dataset="$1"
   local log_file="$LOG_DIR/${dataset}.log"
   local dataset_root="$DATA_ROOT_BASE/$dataset"
-  local promptem_data_dir="$ROOT_DIR/data/$dataset"
+  local promptem_data_dir="$REPO_ROOT/data/$dataset"
   local local_teacher_epochs="$TEACHER_EPOCHS"
   local local_student_epochs="$STUDENT_EPOCHS"
   local local_test_every="$TEST_EVERY"
@@ -78,7 +136,7 @@ run_dataset() {
 
   if [[ "$FORCE_CONVERT" == "1" || ! -f "$promptem_data_dir/manifest.json" ]]; then
     echo "[$(date '+%F %T')] [DATASET=$dataset] convert 1218 -> PromptEM" | tee -a "$log_file"
-    "$PYTHON" "$ROOT_DIR/convert_1218_to_promptem.py" \
+    "$PYTHON_BIN" "$REPO_ROOT/convert_1218_to_promptem.py" \
       --dataset-root "$dataset_root" \
       --output-dir "$promptem_data_dir" \
       --max-cell-chars 200 \
@@ -88,7 +146,7 @@ run_dataset() {
   fi
 
   cmd=(
-    "$PYTHON" "$ROOT_DIR/main.py"
+    "$PYTHON_BIN" "$REPO_ROOT/main.py"
     -d "$dataset"
     --device "$DEVICE"
     -k "$K"
@@ -121,7 +179,7 @@ run_dataset() {
   echo "[$(date '+%F %T')] [DATASET=$dataset] run: ${cmd[*]}" | tee -a "$log_file"
   "${cmd[@]}" 2>&1 | tee -a "$log_file"
 
-  "$PYTHON" - "$dataset" "$log_file" "$SUMMARY_MD" "$SUMMARY_JSON" <<'PY'
+  "$PYTHON_BIN" - "$dataset" "$log_file" "$SUMMARY_MD" "$SUMMARY_JSON" <<'PY'
 import json
 import re
 import sys
