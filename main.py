@@ -19,8 +19,13 @@ if __name__ == '__main__':
         data.left_entities, data.right_entities = read_entities(data_type, args)
         # samples
         data.train_pairs, data.train_y, \
-        data.train_un_pairs, data.train_un_y = read_ground_truth_few_shot(f"data/{data_type}", ["train"], k=args.k,
-                                                                          return_un_y=True)
+        data.train_un_pairs, data.train_un_y = read_ground_truth_few_shot(
+            f"data/{data_type}",
+            ["train"],
+            k=args.k,
+            seed=common_args.seed,
+            return_un_y=True,
+        )
         data.valid_pairs, data.valid_y = read_ground_truth(f"data/{data_type}", ["valid"])
         data.test_pairs, data.test_y = read_ground_truth(f"data/{data_type}", ["test"])
         logging.info(f"left size: {len(data.left_entities)}, right size: {len(data.right_entities)}")

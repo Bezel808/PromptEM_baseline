@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+logs/
+runs/
+data/*_040303/
+data/*_1218/

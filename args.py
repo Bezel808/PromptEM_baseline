@@ -31,6 +31,10 @@ class PromptEMArgs:
         self.test_every = args.test_every
         self.test_pseudo_label = args.test_pseudo_label
         self.one_word=args.one_word
+        self.strict_eval = args.strict_eval
+        self.profile = args.profile
+        self.profile_interval_sec = args.profile_interval_sec
+        self.profile_out = args.profile_out
         if self.dynamic_dataset != -1:
             assert self.self_training
         if not self.self_training and len(args.test_pseudo_label) == 0:
@@ -96,6 +100,11 @@ def parse_args():
                         help="Run test evaluation every N epochs.")
     parser.add_argument("--test_pseudo_label", "-tpl", type=str, default="")
     parser.add_argument("--one_word","-ow",action="store_true",default=False)
+    parser.add_argument("--strict-eval", dest="strict_eval", action="store_true", default=True)
+    parser.add_argument("--no-strict-eval", dest="strict_eval", action="store_false")
+    parser.add_argument("--profile", action="store_true", default=False)
+    parser.add_argument("--profile-interval-sec", type=float, default=1.0)
+    parser.add_argument("--profile-out", type=str, default="")
 
     args = parser.parse_args()
     return args

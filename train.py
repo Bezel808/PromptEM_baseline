@@ -1,6 +1,8 @@
 import logging
 import random
 import copy
+import json
+import numpy as np
 from torch import nn
 from torch.cuda.amp import autocast, GradScaler
 from torch.nn import CrossEntropyLoss
@@ -35,7 +37,7 @@ def train_plm(args: PromptEMArgs, model, labeled_train_dataloader, optimizer, sc
     return np.array(loss_total).mean()
 
 
-def eval_plm(args: PromptEMArgs, model, data_loader, return_acc=False):
+def eval_plm(args: PromptEMArgs, model, data_loader, return_acc=False, return_arrays=False):
     model.eval()
     y_truth = []
     y_pred = []
@@ -59,6 +61,8 @@ def eval_plm(args: PromptEMArgs, model, data_loader, return_acc=False):
         auc = roc_auc_score(y_truth, y_prob)
     except ValueError:
         auc = 0.0
+    if return_arrays:
+        return precision, recall, f1, acc, auc, y_truth, y_prob
     return precision, recall, f1, acc, auc
 
 
@@ -81,7 +85,7 @@ def train_prompt(args: PromptEMArgs, model, labeled_train_dataloader, optimizer,
     return np.array(loss_total).mean()
 
 
-def eval_prompt(args: PromptEMArgs, model, data_loader, return_acc=False):
+def eval_prompt(args: PromptEMArgs, model, data_loader, return_acc=False, return_arrays=False):
     model.eval()
     y_truth_all = []
     y_pred_all = []
@@ -105,6 +109,8 @@ def eval_prompt(args: PromptEMArgs, model, data_loader, return_acc=False):
         auc = roc_auc_score(y_truth_all, y_prob_all)
     except ValueError:
         auc = 0.0
+    if return_arrays:
+        return precision, recall, f1, acc, auc, y_truth_all, y_prob_all
     return precision, recall, f1, acc, auc
 
 
@@ -165,6 +171,80 @@ class BestMetric:
         self.valid_f1 = -1
         self.test_metric = None
         self.state_dict = None
+
+
+def _metrics_at_threshold(y_true: np.ndarray, y_prob: np.ndarray, threshold: float):
+    y_pred = (y_prob >= threshold).astype(np.int64)
+    precision, recall, f1 = evaluate(y_true, y_pred, return_acc=False)
+    acc = accuracy_score(y_true, y_pred)
+    try:
+        auc = roc_auc_score(y_true, y_prob)
+    except ValueError:
+        auc = 0.0
+    return {
+        "f1": float(f1),
+        "precision": float(precision),
+        "recall": float(recall),
+        "accuracy": float(acc),
+        "auc": float(auc),
+    }
+
+
+def _find_best_threshold_by_f1(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    thresholds = np.unique(y_prob)
+    if thresholds.size == 0:
+        return 0.5
+    if thresholds.size > 2000:
+        thresholds = np.percentile(y_prob, np.linspace(0.0, 100.0, 1000))
+    best_t = 0.5
+    best_f1 = -1.0
+    best_precision = -1.0
+    for t in thresholds:
+        m = _metrics_at_threshold(y_true, y_prob, float(t))
+        if m["f1"] > best_f1:
+            best_t = float(t)
+            best_f1 = m["f1"]
+            best_precision = m["precision"]
+            continue
+        if abs(m["f1"] - best_f1) < 1e-12 and m["precision"] > best_precision:
+            best_t = float(t)
+            best_precision = m["precision"]
+    return best_t
+
+
+def compute_strict_eval(args: PromptEMArgs, model, valid_loader, test_loader, prompt=True):
+    if prompt:
+        _, _, _, _, _, y_valid, s_valid = eval_prompt(args, model, valid_loader, return_arrays=True)
+        _, _, _, _, _, y_test, s_test = eval_prompt(args, model, test_loader, return_arrays=True)
+    else:
+        _, _, _, _, _, y_valid, s_valid = eval_plm(args, model, valid_loader, return_arrays=True)
+        _, _, _, _, _, y_test, s_test = eval_plm(args, model, test_loader, return_arrays=True)
+
+    y_valid = np.asarray(y_valid, dtype=np.int64)
+    s_valid = np.asarray(s_valid, dtype=np.float64)
+    y_test = np.asarray(y_test, dtype=np.int64)
+    s_test = np.asarray(s_test, dtype=np.float64)
+
+    threshold = _find_best_threshold_by_f1(y_valid, s_valid) if args.strict_eval else 0.5
+    valid_metrics = _metrics_at_threshold(y_valid, s_valid, threshold)
+    test_metrics = _metrics_at_threshold(y_test, s_test, threshold)
+
+    strict_eval = {
+        "enabled": bool(args.strict_eval),
+        "threshold_source": "validate",
+        "threshold": float(threshold),
+        "valid_metrics": valid_metrics,
+        "test_metrics": test_metrics,
+        "coverage": {
+            "valid_total": int(len(y_valid)),
+            "valid_used": int(len(y_valid)),
+            "test_total": int(len(y_test)),
+            "test_used": int(len(y_test)),
+        },
+        "skipped": {"valid": 0, "test": 0},
+        "failed": {"valid": 0, "test": 0},
+    }
+    return strict_eval
 
 
 def inner_train(args: PromptEMArgs, model, optimizer, scaler, train_dataloader, valid_dataloader, test_dataloader,
@@ -235,6 +315,7 @@ def self_training(args: PromptEMArgs, data: PromptEMData):
     test_loader = get_prompt_dataloader(args, test_set, shuffle=False)
     train_loader = get_prompt_dataloader(args, train_set, shuffle=True)
     best = BestMetric()
+    strict_eval_latest = None
     for iter in range(1, args.num_iter + 1):
         # train the teacher model
         model, tokenizer, wrapperClass, template = get_prompt_model(args)
@@ -290,6 +371,11 @@ def self_training(args: PromptEMArgs, data: PromptEMData):
             f"[Best in iter#{iter}] Precision: {p:.4f}, Recall: {r:.4f}, F1: {f1:.4f}, "
             f"Accuracy: {acc:.4f}, AUC: {auc:.4f}"
         )
+        if best.state_dict is not None:
+            model.load_state_dict(best.state_dict)
+            model.eval()
+            strict_eval_latest = compute_strict_eval(args, model, valid_loader, test_loader, prompt=True)
+            logging.info(f"[STRICT_EVAL_JSON] {json.dumps(strict_eval_latest, ensure_ascii=False)}")
 
 
 def self_training_only_plm(args: PromptEMArgs, data: PromptEMData):
@@ -300,6 +386,7 @@ def self_training_only_plm(args: PromptEMArgs, data: PromptEMData):
     valid_loader = DataLoader(dataset=valid_set, batch_size=args.batch_size, collate_fn=TypeDataset.pad)
     test_loader = DataLoader(dataset=test_set, batch_size=args.batch_size, collate_fn=TypeDataset.pad)
     best = BestMetric()
+    strict_eval_latest = None
     for iter in range(1, args.num_iter + 1):
         # train the teacher model
         model = LMNet()
@@ -357,3 +444,8 @@ def self_training_only_plm(args: PromptEMArgs, data: PromptEMData):
             f"[Best in iter#{iter}] Precision: {p:.4f}, Recall: {r:.4f}, F1: {f1:.4f}, "
             f"Accuracy: {acc:.4f}, AUC: {auc:.4f}"
         )
+        if best.state_dict is not None:
+            model.load_state_dict(best.state_dict)
+            model.eval()
+            strict_eval_latest = compute_strict_eval(args, model, valid_loader, test_loader, prompt=False)
+            logging.info(f"[STRICT_EVAL_JSON] {json.dumps(strict_eval_latest, ensure_ascii=False)}")

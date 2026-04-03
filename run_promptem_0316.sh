@@ -5,7 +5,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$SCRIPT_DIR"
 cd "$REPO_ROOT"
 
-# Python executable: env override > common local env paths > system python3
+COMMON_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
+PROFILE_HELPERS="$COMMON_ROOT/baseline_common/profiling_helpers.sh"
+AGGREGATE_PY="$COMMON_ROOT/baseline_common/profiling_aggregate.py"
+
 PYTHON_BIN="${PYTHON_BIN:-}"
 if [[ -z "$PYTHON_BIN" ]]; then
   for cand in \
@@ -29,7 +32,6 @@ if [[ -z "${PYTHON_BIN:-}" ]]; then
   fi
 fi
 
-# Dataset root: env override > repo-adjacent candidates > known legacy absolute path
 DATA_ROOT_BASE="${DATA_ROOT_BASE:-}"
 if [[ -z "$DATA_ROOT_BASE" ]]; then
   for cand in \
@@ -52,9 +54,22 @@ fi
 DATASETS="${DATASETS:-wikidbs_1218 santos_benchmark_1218 magellan_1218}"
 GPU="${GPU:-}"
 
-# Training defaults (full-label EM)
+STRICT_EVAL="${STRICT_EVAL:-1}"
+PROFILE="${PROFILE:-0}"
+PROFILE_INTERVAL_SEC="${PROFILE_INTERVAL_SEC:-1.0}"
+PROFILE_OUT="${PROFILE_OUT:-}"
+
+# PromptEM baseline for this paper run should always allow online HF fetch.
+unset TRANSFORMERS_OFFLINE || true
+unset HF_HUB_OFFLINE || true
+unset HF_DATASETS_OFFLINE || true
+export TRANSFORMERS_OFFLINE=0
+export HF_HUB_OFFLINE=0
+export HF_DATASETS_OFFLINE=0
+
 DEVICE="${DEVICE:-cuda}"
-K="${K:-1.0}"
+MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-roberta-base}"
+K="${K:-0.1}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
 MAX_LENGTH="${MAX_LENGTH:-512}"
 LR="${LR:-2e-5}"
@@ -63,23 +78,25 @@ TEACHER_EPOCHS="${TEACHER_EPOCHS:-20}"
 STUDENT_EPOCHS="${STUDENT_EPOCHS:-30}"
 TEST_EVERY="${TEST_EVERY:-1}"
 SEED="${SEED:-2022}"
-ONLY_PLM="${ONLY_PLM:-1}"
-SELF_TRAIN="${SELF_TRAIN:-0}"
-DYNAMIC_DATASET="${DYNAMIC_DATASET:--1}"
+ONLY_PLM="${ONLY_PLM:-0}"
+SELF_TRAIN="${SELF_TRAIN:-1}"
+DYNAMIC_DATASET="${DYNAMIC_DATASET:-8}"
+PSEUDO_LABEL_METHOD="${PSEUDO_LABEL_METHOD:-uncertainty}"
 UNCERTAINTY_RATIO="${UNCERTAINTY_RATIO:-0.1}"
 EL2N_RATIO="${EL2N_RATIO:-0.1}"
 MC_DROPOUT_PASS="${MC_DROPOUT_PASS:-10}"
-TEMPLATE_NO="${TEMPLATE_NO:-0}"
+TEMPLATE_NO="${TEMPLATE_NO:-1}"
 FORCE_CONVERT="${FORCE_CONVERT:-0}"
+EXTRA_ARGS=("$@")
 
-# Optional per-dataset overrides to speed up large datasets.
-MAGELLAN_TEACHER_EPOCHS="${MAGELLAN_TEACHER_EPOCHS:-10}"
+MAGELLAN_TEACHER_EPOCHS="${MAGELLAN_TEACHER_EPOCHS:-${TEACHER_EPOCHS}}"
 MAGELLAN_STUDENT_EPOCHS="${MAGELLAN_STUDENT_EPOCHS:-30}"
-MAGELLAN_TEST_EVERY="${MAGELLAN_TEST_EVERY:-10}"
+MAGELLAN_TEST_EVERY="${MAGELLAN_TEST_EVERY:-${TEST_EVERY}}"
 
 RUNS_ROOT="${RUNS_ROOT:-$REPO_ROOT/runs/promptem_em}"
 TS="$(date +%Y%m%d_%H%M%S)"
-RUN_DIR="${RUNS_ROOT}/k1p0_${TS}"
+K_TAG="${K//./p}"
+RUN_DIR="${RUNS_ROOT}/k${K_TAG}_${TS}"
 LOG_DIR="${RUN_DIR}/logs"
 mkdir -p "$LOG_DIR"
 
@@ -97,6 +114,26 @@ from pathlib import Path
 Path("$SUMMARY_JSON").write_text(json.dumps([], indent=2), encoding="utf-8")
 PY
 
+if [[ -f "$PROFILE_HELPERS" ]]; then
+  # shellcheck source=/home/zongze/mengshichen_projects/baseline_common/profiling_helpers.sh
+  source "$PROFILE_HELPERS"
+else
+  echo "[WARN] profiling helpers not found: $PROFILE_HELPERS" >&2
+fi
+
+cleanup_profile_sampler_on_exit() {
+  if [[ "${PROFILE:-0}" != "1" ]]; then
+    return 0
+  fi
+  if [[ "$(type -t baseline_profile_stop || true)" != "function" ]]; then
+    return 0
+  fi
+  if [[ -n "${BASELINE_PROFILE_SAMPLER_PID:-}" ]]; then
+    baseline_profile_stop "" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup_profile_sampler_on_exit EXIT
+
 if [[ -n "$GPU" ]]; then
   export CUDA_VISIBLE_DEVICES="$GPU"
 fi
@@ -109,6 +146,8 @@ echo "Data Root: $DATA_ROOT_BASE"
 echo "GPU: ${GPU:-<not set>}"
 echo "Device: $DEVICE"
 echo "Datasets: $DATASETS"
+echo "Strict Eval: $STRICT_EVAL"
+echo "Profile: $PROFILE (interval=${PROFILE_INTERVAL_SEC}s)"
 echo "Run Dir: $RUN_DIR"
 echo "========================================="
 
@@ -120,8 +159,12 @@ run_dataset() {
   local local_teacher_epochs="$TEACHER_EPOCHS"
   local local_student_epochs="$STUDENT_EPOCHS"
   local local_test_every="$TEST_EVERY"
+  local convert_elapsed="0.0"
+  local train_elapsed="0.0"
+  local profiling_json=""
+  local profile_dir="${RUN_DIR}/profiling/${dataset}"
 
-  if [[ "$dataset" == "magellan_1218" ]]; then
+  if [[ "$dataset" == magellan_* ]]; then
     local_teacher_epochs="$MAGELLAN_TEACHER_EPOCHS"
     local_student_epochs="$MAGELLAN_STUDENT_EPOCHS"
     local_test_every="$MAGELLAN_TEST_EVERY"
@@ -133,14 +176,38 @@ run_dataset() {
     echo "[ERROR] dataset root not found: $dataset_root" | tee -a "$log_file"
     return 1
   fi
+  for req in \
+    "$dataset_root/datalake_plus" \
+    "$dataset_root/label_plus/entity_matching/train.csv" \
+    "$dataset_root/label_plus/entity_matching/validate.csv" \
+    "$dataset_root/label_plus/entity_matching/test.csv"
+  do
+    if [[ ! -e "$req" ]]; then
+      echo "[ERROR] preflight failed, missing: $req" | tee -a "$log_file"
+      return 1
+    fi
+  done
+
+  mkdir -p "$profile_dir"
+  if declare -F baseline_profile_start >/dev/null 2>&1; then
+    baseline_profile_start "${PROFILE_OUT:-$profile_dir}" "${dataset}_${TS}"
+  fi
 
   if [[ "$FORCE_CONVERT" == "1" || ! -f "$promptem_data_dir/manifest.json" ]]; then
+    local t0_convert
+    t0_convert="$(date +%s.%N)"
     echo "[$(date '+%F %T')] [DATASET=$dataset] convert 1218 -> PromptEM" | tee -a "$log_file"
     "$PYTHON_BIN" "$REPO_ROOT/convert_1218_to_promptem.py" \
       --dataset-root "$dataset_root" \
       --output-dir "$promptem_data_dir" \
       --max-cell-chars 200 \
       --skip-empty 2>&1 | tee -a "$log_file"
+    convert_elapsed="$($PYTHON_BIN - <<PY
+from decimal import Decimal
+from time import time
+print(float(Decimal(str(time())) - Decimal("$t0_convert")))
+PY
+)"
   else
     echo "[$(date '+%F %T')] [DATASET=$dataset] skip convert (manifest exists)" | tee -a "$log_file"
   fi
@@ -148,6 +215,7 @@ run_dataset() {
   cmd=(
     "$PYTHON_BIN" "$REPO_ROOT/main.py"
     -d "$dataset"
+    --model_name_or_path "$MODEL_NAME_OR_PATH"
     --device "$DEVICE"
     -k "$K"
     -bs "$BATCH_SIZE"
@@ -157,12 +225,19 @@ run_dataset() {
     -te "$local_teacher_epochs"
     -se "$local_student_epochs"
     --test_every "$local_test_every"
+    -pm "$PSEUDO_LABEL_METHOD"
     -ur "$UNCERTAINTY_RATIO"
     -er "$EL2N_RATIO"
     -mdp "$MC_DROPOUT_PASS"
     -tn "$TEMPLATE_NO"
     --seed "$SEED"
   )
+
+  if [[ "$STRICT_EVAL" == "1" ]]; then
+    cmd+=(--strict-eval)
+  else
+    cmd+=(--no-strict-eval)
+  fi
 
   if [[ "$SELF_TRAIN" == "1" ]]; then
     cmd+=(-st)
@@ -176,10 +251,26 @@ run_dataset() {
     cmd+=(--only_plm)
   fi
 
-  echo "[$(date '+%F %T')] [DATASET=$dataset] run: ${cmd[*]}" | tee -a "$log_file"
-  "${cmd[@]}" 2>&1 | tee -a "$log_file"
+  cmd+=("${EXTRA_ARGS[@]}")
 
-  "$PYTHON_BIN" - "$dataset" "$log_file" "$SUMMARY_MD" "$SUMMARY_JSON" <<'PY'
+  echo "[$(date '+%F %T')] [DATASET=$dataset] run: ${cmd[*]}" | tee -a "$log_file"
+  local t0_train
+  t0_train="$(date +%s.%N)"
+  "${cmd[@]}" 2>&1 | tee -a "$log_file"
+  train_elapsed="$($PYTHON_BIN - <<PY
+from decimal import Decimal
+from time import time
+print(float(Decimal(str(time())) - Decimal("$t0_train")))
+PY
+)"
+
+  if declare -F baseline_profile_stop >/dev/null 2>&1; then
+    local stage_times_json
+    stage_times_json="$(printf '{"convert": %.6f, "train": %.6f}' "$convert_elapsed" "$train_elapsed")"
+    profiling_json="$(baseline_profile_stop "$stage_times_json")"
+  fi
+
+  "$PYTHON_BIN" - "$dataset" "$log_file" "$SUMMARY_MD" "$SUMMARY_JSON" "$profiling_json" "$STRICT_EVAL" <<'PY'
 import json
 import re
 import sys
@@ -189,6 +280,8 @@ dataset = sys.argv[1]
 log_path = Path(sys.argv[2])
 summary_md = Path(sys.argv[3])
 summary_json = Path(sys.argv[4])
+profiling_path = Path(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[5] else None
+strict_enabled = len(sys.argv) > 6 and sys.argv[6] == "1"
 
 text = log_path.read_text(encoding="utf-8", errors="ignore")
 
@@ -219,6 +312,59 @@ else:
     precision, recall, f1 = map(float, match)
     accuracy, auc = None, None
 
+strict_eval = None
+strict_hits = re.findall(r"\[STRICT_EVAL_JSON\]\s*(\{.*\})", text)
+for blob in reversed(strict_hits):
+    try:
+        strict_eval = json.loads(blob)
+        break
+    except Exception:
+        continue
+
+if strict_eval is None and strict_enabled:
+    valid_total = 0
+    test_total = 0
+    valid_sizes = re.findall(r"valid size: (\d+)", text)
+    test_sizes = re.findall(r"test size: (\d+)", text)
+    if valid_sizes:
+        valid_total = int(valid_sizes[-1])
+    if test_sizes:
+        test_total = int(test_sizes[-1])
+    strict_eval = {
+        "enabled": True,
+        "threshold_source": "validate",
+        "threshold": 0.5,
+        "valid_metrics": {},
+        "test_metrics": {
+            "f1": float(f1),
+            "precision": float(precision),
+            "recall": float(recall),
+            "accuracy": (None if accuracy is None else float(accuracy)),
+            "auc": (None if auc is None else float(auc)),
+        },
+        "coverage": {
+            "valid_total": valid_total,
+            "valid_used": valid_total,
+            "test_total": test_total,
+            "test_used": test_total,
+        },
+        "skipped": {"valid": 0, "test": 0},
+        "failed": {"valid": 0, "test": 0},
+    }
+
+test_metrics = strict_eval.get("test_metrics", {}) if isinstance(strict_eval, dict) else {}
+if accuracy is None and isinstance(test_metrics, dict):
+    accuracy = test_metrics.get("accuracy", None)
+if auc is None and isinstance(test_metrics, dict):
+    auc = test_metrics.get("auc", None)
+
+profiling = {}
+if profiling_path and profiling_path.exists():
+    try:
+        profiling = json.loads(profiling_path.read_text(encoding="utf-8"))
+    except Exception:
+        profiling = {}
+
 entry = {
     "dataset": dataset,
     "precision": precision,
@@ -226,6 +372,13 @@ entry = {
     "f1": f1,
     "accuracy": accuracy,
     "auc": auc,
+    "F1": f1,
+    "Accuracy": accuracy,
+    "Precision": precision,
+    "Recall": recall,
+    "AUC": auc,
+    "strict_eval": strict_eval,
+    "profiling": profiling,
     "log": str(log_path),
 }
 
@@ -236,10 +389,19 @@ summary_json.write_text(json.dumps(items, indent=2), encoding="utf-8")
 with summary_md.open("a", encoding="utf-8") as f:
     acc_s = "NA" if accuracy is None else f"{accuracy:.4f}"
     auc_s = "NA" if auc is None else f"{auc:.4f}"
-    f.write(f"| {dataset} | {precision:.4f} | {recall:.4f} | {f1:.4f} | {acc_s} | {auc_s} | {log_path} |\n")
+    f.write(f"| {dataset} | {precision:.4f} | {recall:.4f} | {f1:.4f} | {acc_s} | {auc_s} | {log_path} |\\n")
 
 print(json.dumps(entry, ensure_ascii=False))
 PY
+
+  if [[ -n "$profiling_json" && -f "$profiling_json" && -f "$AGGREGATE_PY" ]]; then
+    "$PYTHON_BIN" "$AGGREGATE_PY" \
+      --baseline "promptem" \
+      --dataset "$dataset" \
+      --run-id "${TS}_seed${SEED}" \
+      --profiling-json "$profiling_json" \
+      --summary-json "$SUMMARY_JSON" >/dev/null 2>&1 || true
+  fi
 
   echo "[$(date '+%F %T')] [DATASET=$dataset] DONE" | tee -a "$log_file"
 }
